@@ -3,7 +3,7 @@
 *.env
 server/.env
 credentials.json
-token.json
+token*.json
 
 # personal vault — NEVER commit (daily notes, salary/career details,
 # people's info). This repo is public-facing; the vault stays local-only.
