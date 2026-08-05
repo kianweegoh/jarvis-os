@@ -102,6 +102,37 @@ def parse_vault(vault_dir: Path = VAULT_DIR) -> list[Note]:
     return [parse_note(p) for p in sorted(vault_dir.rglob("*.md"))]
 
 
+def build_backlinks(notes: list[Note]) -> dict[str, list[str]]:
+    """{note_id: [ids of notes linking to it]} for the whole vault, in one pass.
+
+    Computed once per parse rather than per lookup. Targets resolve
+    case-insensitively, matching graph.py; self-links are excluded.
+    """
+    by_lower = {note.id.lower(): note.id for note in notes}
+    backlinks: dict[str, list[str]] = {note.id: [] for note in notes}
+
+    for note in notes:
+        for target in note.links:
+            resolved = by_lower.get(target.lower())
+            if resolved is None or resolved == note.id:
+                continue
+            if note.id not in backlinks[resolved]:
+                backlinks[resolved].append(note.id)
+
+    return backlinks
+
+
+def vault_fingerprint(vault_dir: Path = VAULT_DIR) -> tuple[int, float]:
+    """(file count, newest mtime) — cheap staleness check.
+
+    Lets callers skip re-parsing when nothing changed, while still noticing
+    edits made outside this process (an IDE, another session).
+    """
+    paths = list(vault_dir.rglob("*.md"))
+    newest = max((p.stat().st_mtime for p in paths), default=0.0)
+    return len(paths), newest
+
+
 def find_broken_links(notes: list[Note]) -> list[tuple[str, str]]:
     """(source_note_id, missing_target) for every link with no matching note.
 
