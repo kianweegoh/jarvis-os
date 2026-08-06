@@ -3,8 +3,11 @@
 Run:
     server/.venv/Scripts/python -m uvicorn main:app --port 4719 --reload
 """
+import asyncio
 import os
 import tempfile
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import frontmatter
@@ -15,32 +18,72 @@ from graph import build_graph
 from search import SearchError, build_index
 from search import search as search_notes
 from vault import VAULT_DIR, Note, build_backlinks, parse_vault, vault_fingerprint
+from watcher import watch_vault
 
-app = FastAPI(title="Jarvis OS API")
+
+# --- derived-data cache -----------------------------------------------------
+# Everything downstream of the vault's content lives here and is rebuilt as a
+# set: parse -> graph, backlinks, FTS index. Readers take a single reference,
+# so a rebuild swapping `_state` can never be observed half-applied.
+_state: dict = {
+    "fingerprint": None,
+    "notes": [],
+    "backlinks": {},
+    "by_id": {},
+    "graph": {"nodes": [], "links": [], "broken_links": []},
+}
+_rebuild_lock = threading.Lock()
 
 
-# --- parsed-vault cache -----------------------------------------------------
-# The vault is parsed once and reused until a file actually changes, so
-# backlinks are built per parse rather than per request. The fingerprint is a
-# stat-only check, so edits made outside this process (IDE, another session)
-# still invalidate it.
-_state: dict = {"fingerprint": None, "notes": [], "backlinks": {}, "by_id": {}}
+def rebuild_state() -> dict:
+    """Re-derive everything from the vault. Blocking; safe to call from a thread."""
+    global _state
+    with _rebuild_lock:
+        notes = parse_vault()
+        build_index(notes)
+        _state = {
+            "fingerprint": vault_fingerprint(),
+            "notes": notes,
+            "backlinks": build_backlinks(notes),
+            "by_id": {note.id: note for note in notes},
+            "graph": build_graph(notes),
+        }
+        return _state
 
 
 def get_state() -> dict:
-    fingerprint = vault_fingerprint()
-    if fingerprint != _state["fingerprint"]:
-        notes = parse_vault()
-        # Same trigger keeps the FTS index in step with the cache — if the
-        # parse is stale, so is the index. Full rebuild; the vault is small.
-        build_index(notes)
-        _state.update(
-            fingerprint=fingerprint,
-            notes=notes,
-            backlinks=build_backlinks(notes),
-            by_id={note.id: note for note in notes},
-        )
-    return _state
+    """Current derived data.
+
+    The file watcher is the primary freshness mechanism — it rebuilds on
+    change. This per-request fingerprint check is kept as a fallback for the
+    cases the watcher can't cover: the window before startup completes, or a
+    watcher that has died. It is cheap (stat only) and belt-and-suspenders.
+    """
+    state = _state
+    if vault_fingerprint() != state["fingerprint"]:
+        return rebuild_state()
+    return state
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Build once up front so the first request doesn't pay for it.
+    await asyncio.to_thread(rebuild_state)
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(watch_vault(rebuild_state, stop_event))
+    try:
+        yield
+    finally:
+        stop_event.set()
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+app = FastAPI(title="Jarvis OS API", lifespan=lifespan)
 
 
 def _summary(note: Note) -> dict:
@@ -94,7 +137,7 @@ def health():
 
 @app.get("/api/graph")
 def graph():
-    return build_graph(get_state()["notes"])
+    return get_state()["graph"]
 
 
 @app.get("/api/notes")
