@@ -48,6 +48,7 @@ def build_graph(notes: list[Note] | None = None) -> dict:
             "id": note.id,
             "label": note.title or note.id,
             "type": note.type,
+            "tags": note.tags,
             "val": counts[note.id],
         }
         for note in notes

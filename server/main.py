@@ -8,6 +8,7 @@ import os
 import tempfile
 import threading
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 
 import frontmatter
@@ -138,6 +139,35 @@ def health():
 @app.get("/api/graph")
 def graph():
     return get_state()["graph"]
+
+
+@app.get("/api/stats")
+def stats():
+    """Counts only — pulled from the cached parse/graph state, never re-derived."""
+    state = get_state()
+    notes = state["notes"]
+
+    by_type: dict[str, int] = {}
+    for note in notes:
+        key = note.type or "(no type)"
+        by_type[key] = by_type.get(key, 0) + 1
+
+    return {
+        "total_notes": len(notes),
+        "by_type": by_type,
+        "total_edges": len(state["graph"]["links"]),
+    }
+
+
+@app.get("/api/brief/today")
+def brief_today():
+    """Today's daily note, rendered (frontmatter stripped, body + metadata)."""
+    today = date.today().isoformat()
+    state = get_state()
+    note = state["by_id"].get(today)
+    if note is None or note.type != "daily":
+        raise HTTPException(status_code=404, detail=f"No daily note for {today}")
+    return _full(note, state["backlinks"].get(note.id, []))
 
 
 @app.get("/api/notes")

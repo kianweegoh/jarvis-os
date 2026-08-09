@@ -1,0 +1,89 @@
+import { useEffect, useRef, useState } from 'react'
+import { Outlet } from 'react-router-dom'
+import Sidebar from './Sidebar'
+
+// Shared with routed views via <Outlet context>. Only /graph currently
+// consumes it (via useOutletContext), but it's lifted here — not into
+// GraphView — because the controls (filter toggles, search input) live in
+// Sidebar, which Layout renders on every route.
+export interface FilterContext {
+  activeTypes: Set<string>
+  activeTags: Set<string>
+  // null = no search active (distinct from an empty-but-active result set).
+  searchResultIds: Set<string> | null
+}
+
+const SEARCH_DEBOUNCE_MS = 300
+
+function toggleInSet(set: Set<string>, value: string): Set<string> {
+  const next = new Set(set)
+  if (next.has(value)) next.delete(value)
+  else next.add(value)
+  return next
+}
+
+function Layout() {
+  const [activeTypes, setActiveTypes] = useState<Set<string>>(new Set())
+  const [activeTags, setActiveTags] = useState<Set<string>>(new Set())
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResultIds, setSearchResultIds] = useState<Set<string> | null>(null)
+
+  const toggleType = (type: string) => setActiveTypes((prev) => toggleInSet(prev, type))
+  const toggleTag = (tag: string) => setActiveTags((prev) => toggleInSet(prev, tag))
+
+  // Debounced: the input itself updates every keystroke (via setSearchQuery
+  // below), but the network call waits for a quiet period.
+  const searchAbortRef = useRef<AbortController | null>(null)
+  useEffect(() => {
+    const trimmed = searchQuery.trim()
+    if (!trimmed) {
+      setSearchResultIds(null)
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      searchAbortRef.current?.abort()
+      const controller = new AbortController()
+      searchAbortRef.current = controller
+
+      fetch(`/api/search?q=${encodeURIComponent(trimmed)}`, { signal: controller.signal })
+        .then((res) => {
+          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+          return res.json()
+        })
+        .then((json: { results: { id: string }[] }) => {
+          setSearchResultIds(new Set(json.results.map((r) => r.id)))
+        })
+        .catch((err) => {
+          if (err.name !== 'AbortError') console.error('search failed', err)
+        })
+    }, SEARCH_DEBOUNCE_MS)
+
+    return () => window.clearTimeout(timer)
+  }, [searchQuery])
+
+  return (
+    <div className="grid h-screen grid-cols-[220px_1fr_260px] bg-bg text-text font-sans">
+      <aside className="border-r border-border p-4 text-sm overflow-y-auto">
+        <Sidebar
+          activeTypes={activeTypes}
+          activeTags={activeTags}
+          onToggleType={toggleType}
+          onToggleTag={toggleTag}
+          searchQuery={searchQuery}
+          onSearchChange={setSearchQuery}
+        />
+      </aside>
+
+      <main className="overflow-y-auto">
+        <Outlet context={{ activeTypes, activeTags, searchResultIds } satisfies FilterContext} />
+      </main>
+
+      <aside className="border-l border-border p-4 text-sm text-text-dim">
+        Agent HUD — coming Week 5.
+      </aside>
+    </div>
+  )
+}
+
+export default Layout
