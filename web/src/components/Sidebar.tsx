@@ -14,6 +14,13 @@ interface NoteSummary {
   updated: string | null
 }
 
+interface Hub {
+  id: string
+  label: string
+  type: string | null
+  val: number
+}
+
 interface SidebarProps {
   activeTypes: Set<string>
   activeTags: Set<string>
@@ -21,6 +28,10 @@ interface SidebarProps {
   onToggleTag: (tag: string) => void
   searchQuery: string
   onSearchChange: (query: string) => void
+  is3D: boolean
+  onToggle3D: () => void
+  focusedId: string | null
+  onSelectHub: (id: string) => void
 }
 
 function FilterRow({
@@ -57,9 +68,14 @@ function Sidebar({
   onToggleTag,
   searchQuery,
   onSearchChange,
+  is3D,
+  onToggle3D,
+  focusedId,
+  onSelectHub,
 }: SidebarProps) {
   const [stats, setStats] = useState<Stats | null>(null)
   const [tagCounts, setTagCounts] = useState<[string, number][]>([])
+  const [hubs, setHubs] = useState<Hub[]>([])
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -93,6 +109,18 @@ function Sidebar({
       })
   }, [])
 
+  useEffect(() => {
+    fetch('/api/graph/hubs?limit=10')
+      .then((res) => {
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+        return res.json()
+      })
+      .then((json: { hubs: Hub[] }) => setHubs(json.hubs))
+      .catch(() => {
+        // Supplementary, same reasoning as the tag-count fetch above.
+      })
+  }, [])
+
   return (
     <div className="space-y-4">
       <input
@@ -102,6 +130,16 @@ function Sidebar({
         placeholder="Search notes..."
         className="w-full bg-surface border border-border rounded px-2 py-1 text-text text-sm placeholder:text-text-dim focus:outline-none focus:border-accent"
       />
+
+      <button
+        type="button"
+        onClick={onToggle3D}
+        className="w-full flex items-center justify-center gap-2 bg-surface border border-border rounded px-2 py-1 text-xs cursor-pointer"
+      >
+        <span className={is3D ? 'text-text-dim' : 'text-accent font-semibold'}>2D</span>
+        <span className="text-text-dim">/</span>
+        <span className={is3D ? 'text-accent font-semibold' : 'text-text-dim'}>3D</span>
+      </button>
 
       {error && <p className="text-text-dim">Stats unavailable: {error}</p>}
       {!error && !stats && <p className="text-text-dim">Loading...</p>}
@@ -152,6 +190,25 @@ function Sidebar({
                     count={count}
                     active={activeTags.has(tag)}
                     onClick={() => onToggleTag(tag)}
+                  />
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {hubs.length > 0 && (
+            <div>
+              <div className="text-text-dim uppercase tracking-wide text-xs mb-1">
+                Top hubs
+              </div>
+              <ul className="space-y-0.5">
+                {hubs.map((hub) => (
+                  <FilterRow
+                    key={hub.id}
+                    label={hub.label}
+                    count={hub.val}
+                    active={focusedId === hub.id}
+                    onClick={() => onSelectHub(hub.id)}
                   />
                 ))}
               </ul>

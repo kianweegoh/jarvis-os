@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useOutletContext } from 'react-router-dom'
-import ForceGraph2D, { type ForceGraphMethods } from 'react-force-graph-2d'
+import ForceGraph2D, { type ForceGraphMethods as ForceGraphMethods2D } from 'react-force-graph-2d'
+import ForceGraph3D, { type ForceGraphMethods as ForceGraphMethods3D } from 'react-force-graph-3d'
 import type { FilterContext } from '../components/Layout'
 
 interface GraphNode {
@@ -11,6 +12,7 @@ interface GraphNode {
   val: number
   x?: number
   y?: number
+  z?: number
 }
 
 interface GraphLink {
@@ -43,17 +45,32 @@ const DEFAULT_NODE_COLOR = '#7A7A7E'
 // index.css's --color-bg.
 const GRAPH_BG = '#151517'
 
-// force-graph's own default link stroke (read from node_modules/force-graph's
-// source — it falls back to this whenever no explicit linkColor is set).
-// Reproduced here so dimming can happen *around* it without changing how a
-// fully-visible link actually looks.
-const LINK_COLOR_DEFAULT = 'rgba(0,0,0,0.15)'
-const LINK_COLOR_DIMMED = 'rgba(0,0,0,0.03)'
+// NOT force-graph's own default (that's black at 15% opacity — a sensible
+// default against force-graph's typical light/white demo backgrounds, but
+// on this app's near-black GRAPH_BG a black line at 15% opacity differs from
+// the background by ~3/255 per channel: invisible in practice, not just
+// faint. This bug predates the 2D/3D toggle work entirely — verified by
+// diffing against the exact last-committed GraphView.tsx, byte for byte,
+// which shows the same invisible-link behavior. White reads correctly
+// against a dark background the way black read against force-graph's
+// assumed light one.
+const LINK_COLOR_DEFAULT = 'rgba(255,255,255,0.15)'
+const LINK_COLOR_DIMMED = 'rgba(255,255,255,0.03)'
 const DIM_ALPHA = 0.15
+
+// Without an explicit linkWidth, three-forcegraph draws links as bare
+// THREE.Line + LineBasicMaterial — a raw WebGL line whose `linewidth` most
+// GPUs (via ANGLE on Windows in particular) silently ignore, always
+// rendering it at 1px regardless of the requested value. Any truthy
+// linkWidth switches it to an actual CylinderGeometry mesh instead, which
+// has real, controllable screen-space width. 2D has no equivalent gap —
+// canvas strokes already have real, anti-aliased width — so this is 3D-only.
+const LINK_WIDTH_3D = 0.6
 
 const DOUBLE_CLICK_MS = 500
 const CAMERA_DURATION_MS = 800
 const SINGLE_MATCH_ZOOM = 6
+const SINGLE_MATCH_CAMERA_DISTANCE_3D = 120
 
 function hexToRgb(hex: string): [number, number, number] {
   const n = parseInt(hex.replace('#', ''), 16)
@@ -73,13 +90,17 @@ function resolveEndpoint(
 
 function GraphView() {
   const navigate = useNavigate()
-  const { activeTypes, activeTags, searchResultIds } = useOutletContext<FilterContext>()
+  const { activeTypes, activeTags, searchResultIds, is3D, focusedId, setFocusedId } =
+    useOutletContext<FilterContext>()
   const containerRef = useRef<HTMLDivElement>(null)
-  const fgRef = useRef<ForceGraphMethods<GraphNode, GraphLink> | undefined>(undefined)
+  // Separate refs per renderer — 2D and 3D expose different imperative APIs
+  // (see the camera-follow effect below), so one ref can't type-check for
+  // both. Only one is ever mounted at a time, driven by is3D.
+  const fg2DRef = useRef<ForceGraphMethods2D<GraphNode, GraphLink> | undefined>(undefined)
+  const fg3DRef = useRef<ForceGraphMethods3D<GraphNode, GraphLink> | undefined>(undefined)
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
   const [data, setData] = useState<GraphData | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [focusedId, setFocusedId] = useState<string | null>(null)
 
   // Built once when data arrives, from the raw fetched ids — independent of
   // the link objects react-force-graph mutates in place, so both stay
@@ -128,7 +149,8 @@ function GraphView() {
   // Type/tag filters, focus mode, and search are three independent dimming
   // conditions — a node (or link) must pass all three to stay full opacity.
   // Multiple selected types/tags are OR'd within their own facet (any match
-  // counts); the facets, focus, and search are AND'd together.
+  // counts); the facets, focus, and search are AND'd together. Identical in
+  // 2D and 3D — these only touch id/type/tags/val, never x/y/z.
   const passesFilters = useCallback(
     (node: GraphNode) => {
       const typeOk = activeTypes.size === 0 || activeTypes.has(node.type ?? '')
@@ -156,6 +178,10 @@ function GraphView() {
     [passesFilters, passesFocus, passesSearch],
   )
 
+  // Click/double-click disambiguation is pure JS timing keyed on node.id —
+  // no 2D/3D-specific API involved, so this is shared unmodified. Confirmed
+  // onNodeClick / onBackgroundClick have identical signatures in both
+  // libraries.
   const handleNodeClick = useCallback(
     (node: GraphNode) => {
       const pending = pendingClickRef.current
@@ -175,7 +201,7 @@ function GraphView() {
       }, DOUBLE_CLICK_MS)
       pendingClickRef.current = { nodeId: node.id, timer }
     },
-    [navigate],
+    [navigate, setFocusedId],
   )
 
   // A committed search takes over from focus mode rather than composing with
@@ -192,13 +218,42 @@ function GraphView() {
 
   // Camera follows search matches. Single match: center + zoom in on it.
   // Multiple: zoomToFit framed to just the matched nodes.
+  //
+  // This is the one place 2D and 3D genuinely diverge. 2D exposes
+  // centerAt(x, y, ms) + a separate zoom(scale, ms); 3D has no equivalent —
+  // instead cameraPosition({x,y,z}, lookAt, ms) moves the camera itself, so
+  // "centering and zooming in" on a single match means placing the camera a
+  // fixed distance from the node and pointing it there. zoomToFit exists in
+  // both with the same signature, so the multi-match branch is unforked.
   useEffect(() => {
     if (!data || !searchResultIds || searchResultIds.size === 0) return
-    const fg = fgRef.current
-    if (!fg) return
-
     const matchedIds = [...searchResultIds]
 
+    if (is3D) {
+      const fg = fg3DRef.current
+      if (!fg) return
+      if (matchedIds.length === 1) {
+        const node = nodesByIdRef.current.get(matchedIds[0])
+        if (
+          node &&
+          typeof node.x === 'number' &&
+          typeof node.y === 'number' &&
+          typeof node.z === 'number'
+        ) {
+          fg.cameraPosition(
+            { x: node.x, y: node.y, z: node.z + SINGLE_MATCH_CAMERA_DISTANCE_3D },
+            { x: node.x, y: node.y, z: node.z },
+            CAMERA_DURATION_MS,
+          )
+        }
+        return
+      }
+      fg.zoomToFit(CAMERA_DURATION_MS, 60, (node) => searchResultIds.has(String(node.id)))
+      return
+    }
+
+    const fg = fg2DRef.current
+    if (!fg) return
     if (matchedIds.length === 1) {
       const node = nodesByIdRef.current.get(matchedIds[0])
       if (node && typeof node.x === 'number' && typeof node.y === 'number') {
@@ -207,9 +262,42 @@ function GraphView() {
       }
       return
     }
-
     fg.zoomToFit(CAMERA_DURATION_MS, 60, (node) => searchResultIds.has(String(node.id)))
-  }, [searchResultIds, data])
+  }, [searchResultIds, data, is3D])
+
+  const sharedProps = {
+    graphData: { nodes: data?.nodes ?? [], links: data?.links ?? [] },
+    width: dimensions.width,
+    height: dimensions.height,
+    backgroundColor: GRAPH_BG,
+    nodeColor: (node: GraphNode) => {
+      const base = TYPE_COLORS[node.type ?? ''] ?? DEFAULT_NODE_COLOR
+      if (isNodeVisible(node)) return base
+      const [r, g, b] = hexToRgb(base)
+      return `rgba(${r}, ${g}, ${b}, ${DIM_ALPHA})`
+    },
+    // Leaf notes (val: 0) still need to render as a visible node.
+    nodeVal: (node: GraphNode) => Math.max(node.val, 1),
+    nodeLabel: 'label' as const,
+    linkColor: (link: GraphLink) => {
+      const source = resolveEndpoint(link.source, nodesByIdRef.current)
+      const target = resolveEndpoint(link.target, nodesByIdRef.current)
+      const bothPass =
+        !!source &&
+        !!target &&
+        passesFilters(source) &&
+        passesFilters(target) &&
+        passesSearch(source.id) &&
+        passesSearch(target.id)
+      if (!bothPass) return LINK_COLOR_DIMMED
+      if (focusedId === null) return LINK_COLOR_DEFAULT
+      return source!.id === focusedId || target!.id === focusedId
+        ? LINK_COLOR_DEFAULT
+        : LINK_COLOR_DIMMED
+    },
+    onNodeClick: handleNodeClick,
+    onBackgroundClick: () => setFocusedId(null),
+  }
 
   return (
     <div ref={containerRef} className="h-full w-full">
@@ -220,42 +308,28 @@ function GraphView() {
         <p className="text-text-dim font-sans text-base p-6">Loading...</p>
       )}
       {data && dimensions.width > 0 && (
-        <ForceGraph2D<GraphNode, GraphLink>
-          ref={fgRef}
-          graphData={{ nodes: data.nodes, links: data.links }}
-          width={dimensions.width}
-          height={dimensions.height}
-          backgroundColor={GRAPH_BG}
-          nodeColor={(node) => {
-            const base = TYPE_COLORS[node.type ?? ''] ?? DEFAULT_NODE_COLOR
-            if (isNodeVisible(node)) return base
-            const [r, g, b] = hexToRgb(base)
-            return `rgba(${r}, ${g}, ${b}, ${DIM_ALPHA})`
-          }}
-          // Leaf notes (val: 0) still need to render as a visible dot.
-          nodeVal={(node) => Math.max(node.val, 1)}
-          nodeLabel="label"
-          linkColor={(link) => {
-            const source = resolveEndpoint(link.source, nodesByIdRef.current)
-            const target = resolveEndpoint(link.target, nodesByIdRef.current)
-            const bothPass =
-              !!source &&
-              !!target &&
-              passesFilters(source) &&
-              passesFilters(target) &&
-              passesSearch(source.id) &&
-              passesSearch(target.id)
-            if (!bothPass) return LINK_COLOR_DIMMED
-            if (focusedId === null) return LINK_COLOR_DEFAULT
-            return source!.id === focusedId || target!.id === focusedId
-              ? LINK_COLOR_DEFAULT
-              : LINK_COLOR_DIMMED
-          }}
-          onNodeClick={handleNodeClick}
-          onBackgroundClick={() => setFocusedId(null)}
-          // Physics/interaction stay at react-force-graph defaults —
-          // force-tuning is Day 39 (Week 6).
-        />
+        is3D ? (
+          // three-forcegraph (the engine behind ForceGraph3D) multiplies
+          // every node/link color's alpha by its own nodeOpacity/linkOpacity
+          // config — defaults are 0.75 and 0.2 respectively. 2D has no such
+          // concept (canvas fillStyle uses the color string as-is), so left
+          // at 3D's defaults, "full opacity" renders permanently dimmed and
+          // the default-vs-dimmed link distinction nearly disappears
+          // (0.15 * 0.2 ≈ 0.03, the same as the dimmed link alpha). Forcing
+          // both to 1 here makes the color strings themselves the only
+          // source of opacity, matching 2D's behavior.
+          <ForceGraph3D<GraphNode, GraphLink>
+            ref={fg3DRef}
+            {...sharedProps}
+            nodeOpacity={1}
+            linkOpacity={1}
+            linkWidth={LINK_WIDTH_3D}
+          />
+        ) : (
+          <ForceGraph2D<GraphNode, GraphLink> ref={fg2DRef} {...sharedProps} />
+        )
+        // Physics/interaction stay at react-force-graph defaults —
+        // force-tuning is a later addition, not part of this pass.
       )}
     </div>
   )

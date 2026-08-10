@@ -11,6 +11,12 @@ export interface FilterContext {
   activeTags: Set<string>
   // null = no search active (distinct from an empty-but-active result set).
   searchResultIds: Set<string> | null
+  is3D: boolean
+  // null = no node focused. Lifted here (out of GraphView's own state) so
+  // the sidebar's Top Hubs list can drive the same focus mode a graph
+  // double-click does, from outside the graph component entirely.
+  focusedId: string | null
+  setFocusedId: (id: string | null) => void
 }
 
 const SEARCH_DEBOUNCE_MS = 300
@@ -27,6 +33,8 @@ function Layout() {
   const [activeTags, setActiveTags] = useState<Set<string>>(new Set())
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResultIds, setSearchResultIds] = useState<Set<string> | null>(null)
+  const [is3D, setIs3D] = useState(false)
+  const [focusedId, setFocusedId] = useState<string | null>(null)
 
   const toggleType = (type: string) => setActiveTypes((prev) => toggleInSet(prev, type))
   const toggleTag = (tag: string) => setActiveTags((prev) => toggleInSet(prev, tag))
@@ -72,11 +80,28 @@ function Layout() {
           onToggleTag={toggleTag}
           searchQuery={searchQuery}
           onSearchChange={setSearchQuery}
+          is3D={is3D}
+          onToggle3D={() => setIs3D((prev) => !prev)}
+          focusedId={focusedId}
+          // Same toggle rule as double-clicking a graph node: clicking the
+          // already-focused hub again clears focus rather than re-setting it.
+          onSelectHub={(id) => setFocusedId((current) => (current === id ? null : id))}
         />
       </aside>
 
       <main className="overflow-y-auto">
-        <Outlet context={{ activeTypes, activeTags, searchResultIds } satisfies FilterContext} />
+        <Outlet
+          context={
+            {
+              activeTypes,
+              activeTags,
+              searchResultIds,
+              is3D,
+              focusedId,
+              setFocusedId,
+            } satisfies FilterContext
+          }
+        />
       </main>
 
       <aside className="border-l border-border p-4 text-sm text-text-dim">

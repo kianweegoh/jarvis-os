@@ -15,7 +15,7 @@ import frontmatter
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from graph import build_graph
+from graph import build_graph, top_hubs
 from search import SearchError, build_index
 from search import search as search_notes
 from vault import VAULT_DIR, Note, build_backlinks, parse_vault, vault_fingerprint
@@ -139,6 +139,12 @@ def health():
 @app.get("/api/graph")
 def graph():
     return get_state()["graph"]
+
+
+@app.get("/api/graph/hubs")
+def graph_hubs(limit: int = 10):
+    """The most-connected notes — pulled from cached graph state, not re-derived."""
+    return {"hubs": top_hubs(get_state()["graph"]["nodes"], limit=limit)}
 
 
 @app.get("/api/stats")

@@ -57,6 +57,19 @@ def build_graph(notes: list[Note] | None = None) -> dict:
     return {"nodes": nodes, "links": links, "broken_links": broken_links}
 
 
+def top_hubs(nodes: list[dict], limit: int = 10) -> list[dict]:
+    """The `limit` most-connected nodes, val descending.
+
+    Takes the already-built node list — val is a count off the full graph,
+    not something a subset of nodes could recompute correctly.
+    """
+    ranked = sorted(nodes, key=lambda n: -n["val"])[:limit]
+    return [
+        {"id": n["id"], "label": n["label"], "type": n["type"], "val": n["val"]}
+        for n in ranked
+    ]
+
+
 if __name__ == "__main__":
     graph = build_graph()
 
