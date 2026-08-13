@@ -50,11 +50,17 @@ async def watch_vault(
     rebuild: Callable[[], object],
     stop_event: asyncio.Event | None = None,
     vault_dir: Path = VAULT_DIR,
+    on_changed_paths: Callable[[set[str]], None] | None = None,
 ) -> None:
     """Watch `vault_dir` and call `rebuild` after changes settle.
 
     `rebuild` is synchronous and blocking (file I/O + sqlite), so it runs in a
     worker thread — the event loop stays free to serve requests throughout.
+
+    `on_changed_paths`, if given, fires immediately on every raw batch (no
+    debounce) with the set of changed paths — for cheap, targeted reactions
+    (e.g. invalidating a small cache keyed on a specific file) that shouldn't
+    wait on the heavier debounced rebuild.
     """
     pending: asyncio.Task | None = None
 
@@ -75,6 +81,9 @@ async def watch_vault(
         debounce=_WATCHFILES_DEBOUNCE_MS,
         step=_WATCHFILES_STEP_MS,
     ):
+        if on_changed_paths is not None:
+            on_changed_paths({path for _, path in changes})
+
         # Reset the timer: the newest batch always owns the pending rebuild.
         if pending is not None and not pending.done():
             pending.cancel()

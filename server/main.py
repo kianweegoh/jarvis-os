@@ -15,6 +15,7 @@ import frontmatter
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+import agent
 from graph import build_graph, top_hubs
 from search import SearchError, build_index
 from search import search as search_notes
@@ -72,7 +73,9 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(rebuild_state)
 
     stop_event = asyncio.Event()
-    task = asyncio.create_task(watch_vault(rebuild_state, stop_event))
+    task = asyncio.create_task(
+        watch_vault(rebuild_state, stop_event, on_changed_paths=agent.on_vault_changed)
+    )
     try:
         yield
     finally:
@@ -118,6 +121,10 @@ class NoteUpdate(BaseModel):
     content: str
 
 
+class AgentMessage(BaseModel):
+    message: str
+
+
 def _atomic_write(path: Path, content: str) -> None:
     """Write via temp file + os.replace so a failure can't truncate the note."""
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -134,6 +141,15 @@ def _atomic_write(path: Path, content: str) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/api/agent/test")
+async def agent_test(body: AgentMessage):
+    """Day 29: prove the agent loop — no streaming, no tools yet."""
+    if not body.message.strip():
+        raise HTTPException(status_code=400, detail="'message' is required")
+    reply = await agent.ask(body.message)
+    return {"response": reply}
 
 
 @app.get("/api/graph")
