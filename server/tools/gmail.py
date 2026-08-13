@@ -14,6 +14,14 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+# Windows' console defaults stdout to the system codepage (cp1252 here), which
+# can't encode arbitrary Unicode — an emoji in an email subject line crashes
+# every print() downstream with UnicodeEncodeError. Reconfigure to UTF-8 with
+# a safe fallback so an unusual character degrades the display instead of
+# killing the whole command.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 # Resolve against this file's location, not the caller's cwd — same fix as
