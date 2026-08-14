@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useReducer, useRef, useState } from 'react'
 import { Outlet } from 'react-router-dom'
+import AgentHud from './AgentHud'
+import { agentHudReducer, initialAgentHudState } from './agentEvents'
 import ChatPanel from './ChatPanel'
 import Sidebar from './Sidebar'
 
@@ -36,6 +38,11 @@ function Layout() {
   const [searchResultIds, setSearchResultIds] = useState<Set<string> | null>(null)
   const [is3D, setIs3D] = useState(false)
   const [focusedId, setFocusedId] = useState<string | null>(null)
+  // Day 32: ChatPanel forwards every /api/chat SSE event here so AgentHud —
+  // a sibling, not a child of ChatPanel — can render live agent state from
+  // the same stream. See agentEvents.ts for why this is lifted state rather
+  // than a Context/store.
+  const [agentHud, dispatchAgentEvent] = useReducer(agentHudReducer, initialAgentHudState)
 
   const toggleType = (type: string) => setActiveTypes((prev) => toggleInSet(prev, type))
   const toggleTag = (tag: string) => setActiveTags((prev) => toggleInSet(prev, tag))
@@ -105,8 +112,11 @@ function Layout() {
         />
       </main>
 
-      <aside className="overflow-hidden border-l border-border">
-        <ChatPanel />
+      <aside className="flex flex-col overflow-hidden border-l border-border">
+        <AgentHud hud={agentHud} />
+        <div className="min-h-0 flex-1">
+          <ChatPanel onAgentEvent={dispatchAgentEvent} />
+        </div>
       </aside>
     </div>
   )

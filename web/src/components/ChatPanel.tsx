@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import type { AgentEvent } from './agentEvents'
 
 // Local component state per the Day 31 spec — nothing else needs chat
 // history yet, so no global store.
@@ -44,7 +45,14 @@ function Message({ msg }: { msg: ChatMessage }) {
   )
 }
 
-function ChatPanel() {
+interface ChatPanelProps {
+  // Day 32: forwards every parsed SSE event upward so AgentHud (a sibling,
+  // not a child) can derive live agent state from the same stream — see
+  // agentEvents.ts for why this is a lifted callback and not a second fetch.
+  onAgentEvent?: (event: AgentEvent) => void
+}
+
+function ChatPanel({ onAgentEvent }: ChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
@@ -147,21 +155,21 @@ function ChatPanel() {
           const dataLine = frame.split('\n').find((line) => line.startsWith('data: '))
           if (!dataLine) continue
 
-          const event = JSON.parse(dataLine.slice('data: '.length)) as {
-            type: string
-            text?: string
-            message?: string
-          }
+          const event = JSON.parse(dataLine.slice('data: '.length)) as AgentEvent
+          // Forward first, unconditionally — ChatPanel stays the transport,
+          // AgentHud's reducer is the one place that decides what each
+          // event type means for on-screen agent state.
+          onAgentEvent?.(event)
 
-          if (event.type === 'token' && event.text) {
+          if (event.type === 'token') {
             const chunk = event.text
             patchLastMessage((msg) => ({ ...msg, content: msg.content + chunk }))
           } else if (event.type === 'done') {
-            const finalMessage = event.message ?? ''
-            patchLastMessage((msg) => ({ ...msg, content: finalMessage, status: 'done' }))
+            patchLastMessage((msg) => ({ ...msg, content: event.message, status: 'done' }))
           }
-          // status / tool_start / tool_end: no visible chat UI for these yet
-          // (tools=[] server-side) — ignored, not an error.
+          // status / tool_start / tool_end: no chat-bubble UI for these —
+          // they're what AgentHud renders instead. Not ignored, just routed
+          // elsewhere.
         }
       }
     } catch (err) {
@@ -170,6 +178,9 @@ function ChatPanel() {
       controller.abort()
       if (err instanceof DOMException && err.name === 'AbortError') return
       patchLastMessage((msg) => ({ ...msg, status: 'error' }))
+      // No real "done" is coming now — tell the HUD the turn is over so it
+      // doesn't stay stuck on Thinking/Using tool forever.
+      onAgentEvent?.({ type: 'stream_error' })
     } finally {
       setIsStreaming(false)
       abortRef.current = null
@@ -178,10 +189,6 @@ function ChatPanel() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="border-b border-border px-3 py-2 text-xs uppercase tracking-wide text-text-dim">
-        Jarvis
-      </div>
-
       <div
         ref={listRef}
         onScroll={handleScroll}

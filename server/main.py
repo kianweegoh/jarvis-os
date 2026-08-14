@@ -145,6 +145,13 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/agent/info")
+def agent_info():
+    """Day 32: lets the HUD show the real model instead of a second hardcoded
+    copy that can drift — `agent.MODEL` is the only place it's defined."""
+    return {"model": agent.MODEL}
+
+
 @app.post("/api/agent/test")
 async def agent_test(body: AgentMessage):
     """Day 29: prove the agent loop — no streaming, no tools yet."""
