@@ -1,15 +1,40 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
+import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { AgentEvent } from './agentEvents'
 
 // Local component state per the Day 31 spec — nothing else needs chat
-// history yet, so no global store.
+// history yet, so no global store. Day 34 widens this to a discriminated
+// union (ChatItem) so a write-proposal card can live in the same ordered
+// stream as chat bubbles, not a separate list.
 interface ChatMessage {
+  kind: 'message'
   role: 'user' | 'assistant'
   content: string
   status: 'streaming' | 'done' | 'error'
 }
+
+// Day 34: mirrors the server's write_proposal event fields (see
+// agentEvents.ts) plus local approve/reject lifecycle state.
+interface WriteProposal {
+  id: string
+  action: 'create' | 'edit'
+  note_id: string
+  title: string
+  content: string
+  frontmatter: Record<string, unknown>
+  target_path: string
+}
+
+interface ProposalItem {
+  kind: 'proposal'
+  proposal: WriteProposal
+  status: 'pending' | 'approved' | 'rejected' | 'error'
+  busy?: boolean
+  error?: string
+}
+
+type ChatItem = ChatMessage | ProposalItem
 
 // How close to the bottom (px) still counts as "at the bottom" for
 // auto-scroll purposes — a manual scroll-up past this disables it until the
@@ -58,6 +83,83 @@ function Message({ msg }: { msg: ChatMessage }) {
   )
 }
 
+// Day 34: a write proposal renders as its own card, not a chat bubble — the
+// point is that it's visibly a different kind of thing (a pending decision,
+// not prose) so it can't be mistaken for something already written.
+function ProposalCard({
+  item,
+  onApprove,
+  onReject,
+}: {
+  item: ProposalItem
+  onApprove: (id: string) => void
+  onReject: (id: string) => void
+}) {
+  const { proposal, status, busy, error } = item
+  const frontmatterEntries = Object.entries(proposal.frontmatter)
+
+  return (
+    <div className="self-stretch rounded border border-accent/40 bg-surface p-3 text-sm">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase tracking-wide text-accent">
+          {proposal.action === 'create' ? 'New note proposed' : 'Edit proposed'}
+        </span>
+        {status === 'approved' && (
+          <span className="text-xs text-accent">✓ Written to {proposal.target_path}</span>
+        )}
+        {status === 'rejected' && <span className="text-xs text-text-dim">Discarded</span>}
+      </div>
+
+      <div className="mb-2">
+        <div className="font-semibold text-text">{proposal.title}</div>
+        <div className="text-xs text-text-dim">
+          {proposal.note_id} · {proposal.target_path}
+        </div>
+      </div>
+
+      {frontmatterEntries.length > 0 && (
+        <dl className="mb-2 grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-xs">
+          {frontmatterEntries.map(([key, value]) => (
+            <Fragment key={key}>
+              <dt className="font-semibold text-text-dim">{key}</dt>
+              <dd className="truncate text-text-dim">
+                {Array.isArray(value) ? value.join(', ') : String(value)}
+              </dd>
+            </Fragment>
+          ))}
+        </dl>
+      )}
+
+      <div className="markdown-body chat-markdown mb-2 rounded border border-border bg-bg p-2">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{proposal.content}</ReactMarkdown>
+      </div>
+
+      {error && <div className="mb-2 text-xs text-red-400">⚠ {error}</div>}
+
+      {(status === 'pending' || status === 'error') && (
+        <div className="flex gap-2">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => onApprove(proposal.id)}
+            className="cursor-pointer rounded bg-accent px-2 py-1 text-xs font-semibold text-bg disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {busy ? '…' : 'Approve'}
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => onReject(proposal.id)}
+            className="cursor-pointer rounded border border-border px-2 py-1 text-xs text-text-dim hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Reject
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 interface ChatPanelProps {
   // Day 32: forwards every parsed SSE event upward so AgentHud (a sibling,
   // not a child) can derive live agent state from the same stream — see
@@ -79,7 +181,7 @@ function ChatPanel({
   onAttachNote,
   onRemoveAttachedNote,
 }: ChatPanelProps) {
-  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [items, setItems] = useState<ChatItem[]>([])
   const [input, setInput] = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
   // null = picker closed. A string (possibly empty, right after typing a
@@ -93,6 +195,14 @@ function ChatPanel({
   // needing to re-run it on every scroll event.
   const autoScrollRef = useRef(true)
   const abortRef = useRef<AbortController | null>(null)
+  // Day 34: a write_proposal event can insert a new item *after* the
+  // streaming assistant message but *before* it finishes (the model can
+  // keep talking after the tool call). "Patch the last item" stopped being
+  // safe the moment a second kind of item could land at the end — this
+  // tracks the assistant message's own index instead, captured once at
+  // send() time, so later token/done events always find the right item
+  // regardless of what got appended after it.
+  const assistantIndexRef = useRef(-1)
 
   // Auto-scroll to the latest content (new messages *and* in-flight token
   // deltas) unless the user has manually scrolled up to read history.
@@ -100,7 +210,7 @@ function ChatPanel({
     if (autoScrollRef.current && listRef.current) {
       listRef.current.scrollTop = listRef.current.scrollHeight
     }
-  }, [messages])
+  }, [items])
 
   // Abort any in-flight stream if the panel unmounts mid-response — same
   // AbortController pattern Layout.tsx uses for the debounced search fetch.
@@ -176,17 +286,73 @@ function ChatPanel({
     inputRef.current?.focus()
   }
 
-  // Applies `fn` to the last message in place — safe because a stream is
-  // only ever in flight while `isStreaming` is true, and input is disabled
-  // for the duration, so the assistant placeholder is guaranteed to still
-  // be the last element.
-  function patchLastMessage(fn: (msg: ChatMessage) => ChatMessage) {
-    setMessages((prev) => {
-      if (prev.length === 0) return prev
+  // Applies `fn` to the item at `index` — a no-op if that slot isn't (or
+  // isn't still) a chat message, so a stale index can't corrupt a proposal
+  // card that happens to occupy the same slot.
+  function patchMessageAt(index: number, fn: (msg: ChatMessage) => ChatMessage) {
+    setItems((prev) => {
+      if (index < 0 || index >= prev.length) return prev
+      const target = prev[index]
+      if (target.kind !== 'message') return prev
       const next = prev.slice()
-      next[next.length - 1] = fn(next[next.length - 1])
+      next[index] = fn(target)
       return next
     })
+  }
+
+  function patchProposal(id: string, fn: (item: ProposalItem) => ProposalItem) {
+    setItems((prev) =>
+      prev.map((item) => (item.kind === 'proposal' && item.proposal.id === id ? fn(item) : item)),
+    )
+  }
+
+  async function approveProposal(id: string) {
+    patchProposal(id, (item) => ({ ...item, busy: true, error: undefined }))
+    try {
+      const res = await fetch(`/api/notes/proposals/${encodeURIComponent(id)}/approve`, {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        const body: { detail?: { error?: string } | string } | null = await res
+          .json()
+          .catch(() => null)
+        const detail = body?.detail
+        const message = typeof detail === 'string' ? detail : detail?.error
+        throw new Error(message ?? `${res.status} ${res.statusText}`)
+      }
+      const saved: { id: string; body: string } = await res.json()
+
+      // Don't just trust the 200 — re-fetch the note fresh from the same
+      // endpoint the note viewer uses and confirm the content on disk
+      // actually matches. This is the same "check the real file, not the
+      // response" instinct that caught Day 17's write bug in the first
+      // place.
+      const verifyRes = await fetch(`/api/notes/${encodeURIComponent(saved.id)}`)
+      if (!verifyRes.ok) {
+        throw new Error('Wrote it, but re-fetching the note to verify failed.')
+      }
+      const verified: { body: string } = await verifyRes.json()
+      if (verified.body !== saved.body) {
+        throw new Error('Verification mismatch — the file on disk does not match the approval.')
+      }
+
+      patchProposal(id, (item) => ({ ...item, status: 'approved', busy: false }))
+    } catch (err) {
+      patchProposal(id, (item) => ({ ...item, status: 'error', busy: false, error: String(err) }))
+    }
+  }
+
+  async function rejectProposal(id: string) {
+    patchProposal(id, (item) => ({ ...item, busy: true, error: undefined }))
+    try {
+      const res = await fetch(`/api/notes/proposals/${encodeURIComponent(id)}/reject`, {
+        method: 'POST',
+      })
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+      patchProposal(id, (item) => ({ ...item, status: 'rejected', busy: false }))
+    } catch (err) {
+      patchProposal(id, (item) => ({ ...item, status: 'error', busy: false, error: String(err) }))
+    }
   }
 
   async function send() {
@@ -194,11 +360,18 @@ function ChatPanel({
     if (!text || isStreaming) return
 
     setInput('')
-    setMessages((prev) => [
-      ...prev,
-      { role: 'user', content: text, status: 'done' },
-      { role: 'assistant', content: '', status: 'streaming' },
-    ])
+    setItems((prev) => {
+      const next: ChatItem[] = [
+        ...prev,
+        { kind: 'message', role: 'user', content: text, status: 'done' },
+        { kind: 'message', role: 'assistant', content: '', status: 'streaming' },
+      ]
+      // The updater runs synchronously, so this is set before send()
+      // continues — see the ref's own comment above for why index, not
+      // "last item", is what later events target.
+      assistantIndexRef.current = next.length - 1
+      return next
+    })
     setIsStreaming(true)
     autoScrollRef.current = true
 
@@ -263,9 +436,36 @@ function ChatPanel({
 
           if (event.type === 'token') {
             const chunk = event.text
-            patchLastMessage((msg) => ({ ...msg, content: msg.content + chunk }))
+            patchMessageAt(assistantIndexRef.current, (msg) => ({
+              ...msg,
+              content: msg.content + chunk,
+            }))
           } else if (event.type === 'done') {
-            patchLastMessage((msg) => ({ ...msg, content: event.message, status: 'done' }))
+            patchMessageAt(assistantIndexRef.current, (msg) => ({
+              ...msg,
+              content: event.message,
+              status: 'done',
+            }))
+          } else if (event.type === 'write_proposal') {
+            // A new item appended after the (possibly still-streaming)
+            // assistant message — see assistantIndexRef's comment for why
+            // that's safe.
+            setItems((prev) => [
+              ...prev,
+              {
+                kind: 'proposal',
+                proposal: {
+                  id: event.id,
+                  action: event.action,
+                  note_id: event.note_id,
+                  title: event.title,
+                  content: event.content,
+                  frontmatter: event.frontmatter,
+                  target_path: event.target_path,
+                },
+                status: 'pending',
+              },
+            ])
           }
           // status / tool_start / tool_end: no chat-bubble UI for these —
           // they're what AgentHud renders instead. Not ignored, just routed
@@ -277,7 +477,7 @@ function ChatPanel({
       // which is us giving up rather than the platform reporting an error.
       controller.abort()
       if (err instanceof DOMException && err.name === 'AbortError') return
-      patchLastMessage((msg) => ({ ...msg, status: 'error' }))
+      patchMessageAt(assistantIndexRef.current, (msg) => ({ ...msg, status: 'error' }))
       // No real "done" is coming now — tell the HUD the turn is over so it
       // doesn't stay stuck on Thinking/Using tool forever.
       onAgentEvent?.({ type: 'stream_error' })
@@ -294,12 +494,14 @@ function ChatPanel({
         onScroll={handleScroll}
         className="flex flex-1 flex-col gap-2 overflow-y-auto p-3"
       >
-        {messages.length === 0 && (
-          <p className="text-sm text-text-dim">Ask Jarvis anything.</p>
+        {items.length === 0 && <p className="text-sm text-text-dim">Ask Jarvis anything.</p>}
+        {items.map((item, i) =>
+          item.kind === 'message' ? (
+            <Message key={i} msg={item} />
+          ) : (
+            <ProposalCard key={i} item={item} onApprove={approveProposal} onReject={rejectProposal} />
+          ),
         )}
-        {messages.map((msg, i) => (
-          <Message key={i} msg={msg} />
-        ))}
       </div>
 
       <div className="relative border-t border-border">

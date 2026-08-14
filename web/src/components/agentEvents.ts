@@ -16,6 +16,19 @@ export type AgentEvent =
   | { type: 'tool_start'; id: string; name: string }
   | { type: 'tool_end'; id: string; name?: string; is_error: boolean }
   | { type: 'token'; text: string }
+  // Day 34: the model proposed a vault write via the propose_note_write
+  // tool. Inert until the user approves/rejects it in ChatPanel — nothing
+  // here or on the wire ever implies the write happened.
+  | {
+      type: 'write_proposal'
+      id: string
+      action: 'create' | 'edit'
+      note_id: string
+      title: string
+      content: string
+      frontmatter: Record<string, unknown>
+      target_path: string
+    }
   | { type: 'done'; message: string }
   // Client-side only, not part of the server's SSE contract: ChatPanel
   // dispatches this when the stream errors or stalls out (Day 31's
@@ -27,8 +40,8 @@ export interface AgentHudState {
   phase: 'idle' | 'thinking'
   // tool_use id -> tool name — same shape as agent.py's own
   // `open_tool_calls` bookkeeping. tool_start adds an entry, the matching
-  // tool_end removes it; unopened until Week 7 gives the agent real tools,
-  // but the wiring is exercised by every status/done event today regardless.
+  // tool_end removes it. Day 34's propose_note_write is the first tool to
+  // actually populate this outside a test.
   openTools: Record<string, string>
 }
 
@@ -50,8 +63,10 @@ export function agentHudReducer(state: AgentHudState, event: AgentEvent): AgentH
     case 'stream_error':
       return initialAgentHudState
     default:
-      // 'token' deltas don't change HUD phase — the agent is still
-      // "thinking" for HUD purposes while it writes out its answer.
+      // 'token' deltas and 'write_proposal' don't change HUD phase — the
+      // agent is still "thinking" for HUD purposes while it writes out its
+      // answer or waits on a proposal decision. ChatPanel renders
+      // write_proposal itself; the HUD just ignores it.
       return state
   }
 }

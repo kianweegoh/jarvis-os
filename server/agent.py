@@ -1,11 +1,13 @@
 """Agent loop — jarvis-os, Day 29-30, context-aware chat added Day 33.
 
 Wraps the Claude Agent SDK with Jarvis's system prompt: vault/CLAUDE.md +
-vault/USER.md + vault/MEMORY.md, concatenated. No tools yet — that's later
-this week; Day 29 proved the loop answers using the vault's context, Day 30
-adds a streaming event generator for the SSE endpoint in main.py. Day 33
-adds per-message note context (the open note + @-mentions) — see
-`ContextNote` and `_augment_message` below.
+vault/USER.md + vault/MEMORY.md, concatenated. Day 29 proved the loop
+answers using the vault's context, Day 30 adds a streaming event generator
+for the SSE endpoint in main.py. Day 33 adds per-message note context (the
+open note + @-mentions) — see `ContextNote` and `_augment_message` below.
+Day 34 adds the first real tool: `propose_note_write`, an in-process SDK
+MCP tool that can only ever *propose* a vault write, never perform one —
+see the "write proposals" section below.
 """
 import asyncio
 import threading
@@ -20,8 +22,11 @@ from claude_agent_sdk import (
     StreamEvent,
     TextBlock,
     ToolResultBlock,
+    ToolUseBlock,
     UserMessage,
+    create_sdk_mcp_server,
     query,
+    tool,
 )
 
 from vault import VAULT_DIR
@@ -146,6 +151,167 @@ def _augment_message(message: str, context_notes: list[ContextNote] | None) -> s
     return _format_context_block(context_notes) + message
 
 
+# --- write proposals (Day 34) -------------------------------------------------
+# The model can *propose* a vault write via a real tool call, but the tool's
+# own handler never touches disk — it only acknowledges. The actual write
+# only ever happens through main.py's POST /api/notes/proposals/{id}/approve,
+# which reuses Day 17's exact validate-then-atomic-write path. This module
+# just captures what the model proposed and holds it, inert, until approved
+# or rejected. No file is written anywhere in this file, full stop.
+_PROPOSE_WRITE_TOOL = "propose_note_write"
+# The SDK/CLI names in-process MCP tools "mcp__<server>__<tool>" — confirmed
+# empirically (a live call with no allowed_tools set came back
+# is_error=True, "permission ... hasn't been granted yet", naming the tool
+# exactly this way) rather than assumed, since guessing wrong here would
+# mean every proposal silently fails permission instead of erroring loudly.
+_PROPOSE_WRITE_TOOL_NAME = f"mcp__jarvis__{_PROPOSE_WRITE_TOOL}"
+
+# Mirrors vault/CLAUDE.md's own frontmatter schema — reusing the vault's
+# documented conventions (type/tags/status/created/updated) rather than
+# inventing a second schema for the model to learn.
+_PROPOSE_WRITE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["create", "edit"]},
+        "note_id": {
+            "type": "string",
+            "description": (
+                "kebab-case note id, matching the vault's id convention "
+                "(e.g. 'day-34-agent-writes'). For 'edit', must exactly "
+                "match an existing note's id."
+            ),
+        },
+        "title": {"type": "string", "description": "Human-readable title."},
+        "content": {
+            "type": "string",
+            "description": (
+                "The note's markdown BODY only — no YAML frontmatter block, "
+                "no '---' delimiters. Link people/projects/tools with "
+                "[[wikilinks]] per vault convention."
+            ),
+        },
+        "frontmatter": {
+            "type": "object",
+            "description": (
+                "Frontmatter fields per vault/CLAUDE.md's schema. 'id' and "
+                "'title' are added automatically from note_id/title — do "
+                "not duplicate them here."
+            ),
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": [
+                        "project",
+                        "note",
+                        "daily",
+                        "person",
+                        "concept",
+                        "tool",
+                        "skill",
+                        "decision",
+                    ],
+                },
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "status": {
+                    "type": "string",
+                    "enum": ["active", "paused", "done", "reference"],
+                },
+                "created": {"type": "string", "description": "YYYY-MM-DD"},
+                "updated": {"type": "string", "description": "YYYY-MM-DD"},
+            },
+            "required": ["type", "tags", "status", "created", "updated"],
+        },
+        "target_path": {
+            "type": "string",
+            "description": (
+                "Relative path within the vault, per CLAUDE.md's file-"
+                "location convention (e.g. 'projects/foo.md', "
+                "'people/bar.md', 'daily/2026-08-14.md', 'inbox/foo.md'). "
+                "Ignored for 'edit' — the existing note's real path is used "
+                "instead."
+            ),
+        },
+    },
+    "required": ["action", "note_id", "title", "content", "frontmatter", "target_path"],
+}
+
+_proposals_lock = threading.Lock()
+_proposals: dict[str, dict[str, Any]] = {}
+
+
+def get_proposal(proposal_id: str) -> dict[str, Any] | None:
+    """The stored proposal, or None if unknown/already resolved."""
+    with _proposals_lock:
+        return _proposals.get(proposal_id)
+
+
+def discard_proposal(proposal_id: str) -> dict[str, Any] | None:
+    """Removes and returns a proposal — on reject, or once approve has
+    finished writing it. Either way a proposal is used at most once."""
+    with _proposals_lock:
+        return _proposals.pop(proposal_id, None)
+
+
+def _register_proposal(proposal_id: str, raw_input: dict[str, Any]) -> dict[str, Any] | None:
+    """The tool call's raw (schema-validated) input -> a stored, pending
+    proposal, and the dict to yield as the write_proposal event.
+
+    Returns None if the model somehow produced something too malformed to
+    use (missing action/note_id) — logged nowhere yet, just dropped, so one
+    bad tool call can't take down the whole stream. The JSON schema above
+    makes this practically unreachable for a well-behaved model, but the
+    check costs nothing.
+    """
+    action = raw_input.get("action")
+    note_id = raw_input.get("note_id")
+    if action not in ("create", "edit") or not note_id:
+        return None
+
+    proposal = {
+        "id": proposal_id,
+        "action": action,
+        "note_id": note_id,
+        "title": raw_input.get("title") or note_id,
+        "content": raw_input.get("content") or "",
+        "frontmatter": raw_input.get("frontmatter") or {},
+        "target_path": raw_input.get("target_path") or f"{note_id}.md",
+    }
+    with _proposals_lock:
+        _proposals[proposal_id] = {**proposal, "status": "pending"}
+    return proposal
+
+
+@tool(
+    _PROPOSE_WRITE_TOOL,
+    "Propose creating or editing a vault note. This does NOT write anything "
+    "— it only shows the user a preview to approve or reject. Never claim "
+    "the note has been created or saved; tell the user it's ready for their "
+    "review instead.",
+    _PROPOSE_WRITE_SCHEMA,
+)
+async def _propose_note_write(args: dict[str, Any]) -> dict[str, Any]:
+    # Intentionally does nothing but acknowledge. The real proposal object is
+    # built from this same tool call's ToolUseBlock once the assistant
+    # message completes (see stream() below) — nothing here or anywhere in
+    # this process touches a file short of main.py's explicit /approve
+    # endpoint.
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    "Proposal recorded and shown to the user. It is NOT "
+                    "written yet — nothing happens until they approve or "
+                    "reject it in the UI."
+                ),
+            }
+        ]
+    }
+
+
+_JARVIS_TOOLS = create_sdk_mcp_server("jarvis", tools=[_propose_note_write])
+
+
 # --- agent loop ---------------------------------------------------------------
 async def ask(message: str, context_notes: list[ContextNote] | None = None) -> str:
     """Run `message` through the Agent SDK with the cached system prompt.
@@ -200,13 +366,17 @@ def ask_sync(message: str) -> str:
 #   {"type": "tool_start", "id": ..., "name": ...}
 #   {"type": "tool_end", "id": ..., "name": ..., "is_error": bool}
 #   {"type": "token", "text": "..."}
+#   {"type": "write_proposal", "id": ..., "action": ..., "note_id": ...,
+#    "title": ..., "content": ..., "frontmatter": {...}, "target_path": ...}
 #   {"type": "done", "message": "<full final text>"}
 #
 # tool_start/tool_end are wired against real SDK message shapes (the raw
 # `content_block_start` stream event for a tool_use block, and the
-# `ToolResultBlock` that comes back in a UserMessage) even though `tools=[]`
-# means neither can fire yet — so turning on real tools later needs no
-# change to this contract, only to what triggers it.
+# `ToolResultBlock` that comes back in a UserMessage) — Day 34's
+# propose_note_write is the first tool to actually exercise this path, and
+# needed no changes to it: only what triggers it changed. write_proposal is
+# a new, separate event type (not a repurposed tool_start) precisely because
+# a proposal carries structured content a generic tool event doesn't.
 async def stream(
     message: str, context_notes: list[ContextNote] | None = None
 ) -> AsyncIterator[dict[str, Any]]:
@@ -217,13 +387,17 @@ async def stream(
     prompt = _augment_message(message, context_notes)
     options = ClaudeAgentOptions(
         system_prompt=get_system_prompt(),
-        tools=[],  # no tools yet — same as ask(); event shapes below are ready regardless
+        tools=[],  # no *built-in* tools — --tools ''; unrelated to the MCP tool below
         model=MODEL,
         include_partial_messages=True,  # turns on StreamEvent token deltas
-        # Same isolation fix as ask() — see the comment there. Without these,
-        # `tools=[]` doesn't stop ambient MCP connectors (Drive, etc.) from
-        # reaching the model.
-        mcp_servers={},
+        # Day 34: the one real tool this agent has, in-process and explicit.
+        # strict_mcp_config + setting_sources=[] (see ask()'s comment for the
+        # isolation reasoning) mean *only* this server is ever available —
+        # never an ambient one — and allowed_tools pre-authorizes just this
+        # tool so a headless server never sits waiting on an interactive
+        # permission prompt nobody can answer.
+        mcp_servers={"jarvis": _JARVIS_TOOLS},
+        allowed_tools=[_PROPOSE_WRITE_TOOL_NAME],
         strict_mcp_config=True,
         setting_sources=[],
     )
@@ -273,6 +447,14 @@ async def stream(
             final_message = "".join(
                 block.text for block in msg.content if isinstance(block, TextBlock)
             )
+            # Same message also carries the fully-parsed ToolUseBlock (id,
+            # name, and the schema-validated input dict) once the tool call
+            # is complete — no need to reassemble it from streaming deltas.
+            for block in msg.content:
+                if isinstance(block, ToolUseBlock) and block.name == _PROPOSE_WRITE_TOOL_NAME:
+                    proposal = _register_proposal(block.id, block.input)
+                    if proposal is not None:
+                        yield {"type": "write_proposal", **proposal}
 
     yield {"type": "done", "message": final_message}
 
