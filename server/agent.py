@@ -1,14 +1,25 @@
-"""Agent loop — jarvis-os, Day 29.
+"""Agent loop — jarvis-os, Day 29-30.
 
 Wraps the Claude Agent SDK with Jarvis's system prompt: vault/CLAUDE.md +
 vault/USER.md + vault/MEMORY.md, concatenated. No tools yet — that's later
-this week; today just proves the loop answers using the vault's context.
+this week; Day 29 proved the loop answers using the vault's context, Day 30
+adds a streaming event generator for the SSE endpoint in main.py.
 """
 import asyncio
 import threading
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    StreamEvent,
+    TextBlock,
+    ToolResultBlock,
+    UserMessage,
+    query,
+)
 
 from vault import VAULT_DIR
 
@@ -114,6 +125,81 @@ async def ask(message: str) -> str:
 def ask_sync(message: str) -> str:
     """Sync wrapper for callers outside an event loop (e.g. a quick CLI check)."""
     return asyncio.run(ask(message))
+
+
+# --- streaming event contract -------------------------------------------------
+# Every event yielded by `stream()` is a plain dict with a "type" key —
+# that's the one convention (vs. an SSE "event:" field) main.py's /api/chat
+# translates 1:1 into wire events. agent.py owns the event shape; main.py
+# owns transport only.
+#
+#   {"type": "status", "state": "thinking"}
+#   {"type": "tool_start", "id": ..., "name": ...}
+#   {"type": "tool_end", "id": ..., "name": ..., "is_error": bool}
+#   {"type": "token", "text": "..."}
+#   {"type": "done", "message": "<full final text>"}
+#
+# tool_start/tool_end are wired against real SDK message shapes (the raw
+# `content_block_start` stream event for a tool_use block, and the
+# `ToolResultBlock` that comes back in a UserMessage) even though `tools=[]`
+# means neither can fire yet — so turning on real tools later needs no
+# change to this contract, only to what triggers it.
+async def stream(message: str) -> AsyncIterator[dict[str, Any]]:
+    """Run `message` through the Agent SDK, yielding structured events live."""
+    options = ClaudeAgentOptions(
+        system_prompt=get_system_prompt(),
+        tools=[],  # no tools yet — same as ask(); event shapes below are ready regardless
+        model=MODEL,
+        include_partial_messages=True,  # turns on StreamEvent token deltas
+    )
+
+    yield {"type": "status", "state": "thinking"}
+
+    # tool_use id -> name, so the eventual tool_end can report which tool
+    # closed. Unused while tools=[] since nothing ever populates it.
+    open_tool_calls: dict[str, str] = {}
+    final_message = ""
+
+    async for msg in query(prompt=message, options=options):
+        if isinstance(msg, StreamEvent):
+            event = msg.event
+            event_type = event.get("type")
+
+            if event_type == "content_block_start":
+                block = event.get("content_block") or {}
+                if block.get("type") == "tool_use":
+                    tool_id = block.get("id", "")
+                    tool_name = block.get("name", "")
+                    open_tool_calls[tool_id] = tool_name
+                    yield {"type": "tool_start", "id": tool_id, "name": tool_name}
+
+            elif event_type == "content_block_delta":
+                delta = event.get("delta") or {}
+                if delta.get("type") == "text_delta" and delta.get("text"):
+                    yield {"type": "token", "text": delta["text"]}
+
+        elif isinstance(msg, UserMessage):
+            # Tool results return to the model as a user message — this is
+            # where tool_end will fire once real tools exist.
+            blocks = msg.content if isinstance(msg.content, list) else []
+            for block in blocks:
+                if isinstance(block, ToolResultBlock):
+                    tool_name = open_tool_calls.pop(block.tool_use_id, None)
+                    yield {
+                        "type": "tool_end",
+                        "id": block.tool_use_id,
+                        "name": tool_name,
+                        "is_error": bool(block.is_error),
+                    }
+
+        elif isinstance(msg, AssistantMessage):
+            # The complete message, authoritative for "done" — same
+            # extraction as ask(), independent of the token deltas above.
+            final_message = "".join(
+                block.text for block in msg.content if isinstance(block, TextBlock)
+            )
+
+    yield {"type": "done", "message": final_message}
 
 
 if __name__ == "__main__":

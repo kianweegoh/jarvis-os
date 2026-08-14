@@ -4,6 +4,7 @@ Run:
     server/.venv/Scripts/python -m uvicorn main:app --port 4719 --reload
 """
 import asyncio
+import json
 import os
 import tempfile
 import threading
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import frontmatter
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import agent
@@ -150,6 +152,29 @@ async def agent_test(body: AgentMessage):
         raise HTTPException(status_code=400, detail="'message' is required")
     reply = await agent.ask(body.message)
     return {"response": reply}
+
+
+async def _sse_events(message: str):
+    """agent.stream()'s dicts, wire-formatted as SSE `data:` lines.
+
+    One convention throughout: event type lives in the JSON payload's "type"
+    key, not the SSE "event:" field — every event arrives as a plain
+    `message` event on the client, distinguished by `data.type`.
+    """
+    async for event in agent.stream(message):
+        yield f"data: {json.dumps(event)}\n\n"
+
+
+@app.post("/api/chat")
+async def chat(body: AgentMessage):
+    """Day 30: streaming counterpart to /api/agent/test — SSE, not one blob."""
+    if not body.message.strip():
+        raise HTTPException(status_code=400, detail="'message' is required")
+    return StreamingResponse(
+        _sse_events(body.message),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/graph")
