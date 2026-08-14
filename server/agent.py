@@ -110,6 +110,16 @@ async def ask(message: str) -> str:
         system_prompt=get_system_prompt(),
         tools=[],  # no tools yet — Day 29 is loop-only
         model=MODEL,
+        # `tools=[]` only zeroes the CLI's *built-in* tool set (--tools '').
+        # Without these three, the spawned CLI subprocess falls back to its
+        # own default of loading ambient user/project settings — including
+        # whatever MCP connectors (e.g. Google Drive) are configured on this
+        # machine's real Claude account — regardless of `tools`. Verified via
+        # a live argv dump on 14 Aug: no --mcp-config/--strict-mcp-config/
+        # --setting-sources meant "zero tools" was never actually enforced.
+        mcp_servers={},
+        strict_mcp_config=True,
+        setting_sources=[],
     )
 
     reply_parts: list[str] = []
@@ -151,6 +161,12 @@ async def stream(message: str) -> AsyncIterator[dict[str, Any]]:
         tools=[],  # no tools yet — same as ask(); event shapes below are ready regardless
         model=MODEL,
         include_partial_messages=True,  # turns on StreamEvent token deltas
+        # Same isolation fix as ask() — see the comment there. Without these,
+        # `tools=[]` doesn't stop ambient MCP connectors (Drive, etc.) from
+        # reaching the model.
+        mcp_servers={},
+        strict_mcp_config=True,
+        setting_sources=[],
     )
 
     yield {"type": "status", "state": "thinking"}
