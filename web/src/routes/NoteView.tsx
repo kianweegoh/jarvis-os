@@ -1,7 +1,8 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useOutletContext, useParams } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import type { FilterContext } from '../components/Layout'
 
 interface NoteDetail {
   id: string
@@ -54,6 +55,7 @@ function Chip({ label }: { label: string }) {
 
 function NoteView() {
   const { id } = useParams()
+  const { setOpenNoteId } = useOutletContext<FilterContext>()
   const [note, setNote] = useState<NoteDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -68,6 +70,14 @@ function NoteView() {
       .then(setNote)
       .catch((err) => setError(String(err)))
   }, [id])
+
+  // Day 33: tells Layout which note is "currently open" for chat context.
+  // Set on every id change, cleared on unmount (navigating away from any
+  // note view) — independent of attachedNoteIds, which this never touches.
+  useEffect(() => {
+    setOpenNoteId(id ?? null)
+    return () => setOpenNoteId(null)
+  }, [id, setOpenNoteId])
 
   return (
     <div className="max-w-3xl mx-auto px-10 py-12">

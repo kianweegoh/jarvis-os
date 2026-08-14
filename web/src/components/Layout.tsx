@@ -5,10 +5,11 @@ import { agentHudReducer, initialAgentHudState } from './agentEvents'
 import ChatPanel from './ChatPanel'
 import Sidebar from './Sidebar'
 
-// Shared with routed views via <Outlet context>. Only /graph currently
-// consumes it (via useOutletContext), but it's lifted here — not into
-// GraphView — because the controls (filter toggles, search input) live in
-// Sidebar, which Layout renders on every route.
+// Shared with routed views via <Outlet context>. Named for its original
+// scope (graph filters); it's since grown a Day 33 addition
+// (setOpenNoteId) that isn't a filter at all, but everything here is still
+// "state a routed view needs to hand up to Layout" — same contract, just
+// not exclusively about filtering anymore.
 export interface FilterContext {
   activeTypes: Set<string>
   activeTags: Set<string>
@@ -20,6 +21,11 @@ export interface FilterContext {
   // double-click does, from outside the graph component entirely.
   focusedId: string | null
   setFocusedId: (id: string | null) => void
+  // Day 33: NoteView calls this on mount/id-change/unmount so ChatPanel
+  // always knows which note (if any) is currently open, for "summarize
+  // this"-style context. Distinct from attachedNoteIds, which navigation
+  // never touches.
+  setOpenNoteId: (id: string | null) => void
 }
 
 const SEARCH_DEBOUNCE_MS = 300
@@ -43,6 +49,20 @@ function Layout() {
   // the same stream. See agentEvents.ts for why this is lifted state rather
   // than a Context/store.
   const [agentHud, dispatchAgentEvent] = useReducer(agentHudReducer, initialAgentHudState)
+  // Day 33: context-aware chat. Two independent pieces, per spec — openNoteId
+  // tracks navigation (set by NoteView via outlet context, cleared on
+  // unmount); attachedNoteIds is purely user-driven via the @-mention picker
+  // and is never touched by navigation. Both lifted here for the same
+  // reason as agentHud above: ChatPanel and NoteView are siblings/routed
+  // children, not parent/child, so Layout is the nearest place that can see
+  // both.
+  const [openNoteId, setOpenNoteId] = useState<string | null>(null)
+  const [attachedNoteIds, setAttachedNoteIds] = useState<string[]>([])
+
+  const attachNote = (id: string) =>
+    setAttachedNoteIds((prev) => (prev.includes(id) ? prev : [...prev, id]))
+  const removeAttachedNote = (id: string) =>
+    setAttachedNoteIds((prev) => prev.filter((existing) => existing !== id))
 
   const toggleType = (type: string) => setActiveTypes((prev) => toggleInSet(prev, type))
   const toggleTag = (tag: string) => setActiveTags((prev) => toggleInSet(prev, tag))
@@ -107,6 +127,7 @@ function Layout() {
               is3D,
               focusedId,
               setFocusedId,
+              setOpenNoteId,
             } satisfies FilterContext
           }
         />
@@ -115,7 +136,13 @@ function Layout() {
       <aside className="flex flex-col overflow-hidden border-l border-border">
         <AgentHud hud={agentHud} />
         <div className="min-h-0 flex-1">
-          <ChatPanel onAgentEvent={dispatchAgentEvent} />
+          <ChatPanel
+            onAgentEvent={dispatchAgentEvent}
+            openNoteId={openNoteId}
+            attachedNoteIds={attachedNoteIds}
+            onAttachNote={attachNote}
+            onRemoveAttachedNote={removeAttachedNote}
+          />
         </div>
       </aside>
     </div>

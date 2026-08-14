@@ -15,7 +15,7 @@ from pathlib import Path
 import frontmatter
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import agent
 from graph import build_graph, top_hubs
@@ -125,6 +125,43 @@ class NoteUpdate(BaseModel):
 
 class AgentMessage(BaseModel):
     message: str
+    # Day 33: context-aware chat. IDs only — main.py resolves them against
+    # the already-parsed/cached vault state (get_state()["by_id"]) rather
+    # than duplicating vault.py's parsing, and hands agent.py the resolved
+    # bodies. open_note_id is kept distinct from attached_note_ids end to
+    # end (not just merged into one list) so "summarize this" can still
+    # resolve unambiguously even when other notes are also attached.
+    open_note_id: str | None = None
+    attached_note_ids: list[str] = Field(default_factory=list)
+
+
+def _resolve_context_notes(body: AgentMessage) -> list[agent.ContextNote]:
+    """AgentMessage's note ids -> agent.ContextNote's with real content.
+
+    Unknown/deleted ids are skipped rather than erroring the whole
+    request — the same resilience-over-strictness call the rest of this
+    file makes for supplementary lookups.
+    """
+    by_id = get_state()["by_id"]
+    notes: list[agent.ContextNote] = []
+
+    if body.open_note_id:
+        note = by_id.get(body.open_note_id)
+        if note is not None:
+            notes.append(
+                agent.ContextNote(id=note.id, title=note.title, role="open", body=note.body)
+            )
+
+    for note_id in body.attached_note_ids:
+        if note_id == body.open_note_id:
+            continue  # already included above as the open note
+        note = by_id.get(note_id)
+        if note is not None:
+            notes.append(
+                agent.ContextNote(id=note.id, title=note.title, role="attached", body=note.body)
+            )
+
+    return notes
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -157,28 +194,34 @@ async def agent_test(body: AgentMessage):
     """Day 29: prove the agent loop — no streaming, no tools yet."""
     if not body.message.strip():
         raise HTTPException(status_code=400, detail="'message' is required")
-    reply = await agent.ask(body.message)
+    reply = await agent.ask(body.message, context_notes=_resolve_context_notes(body))
     return {"response": reply}
 
 
-async def _sse_events(message: str):
+async def _sse_events(body: AgentMessage):
     """agent.stream()'s dicts, wire-formatted as SSE `data:` lines.
 
     One convention throughout: event type lives in the JSON payload's "type"
     key, not the SSE "event:" field — every event arrives as a plain
     `message` event on the client, distinguished by `data.type`.
     """
-    async for event in agent.stream(message):
+    context_notes = _resolve_context_notes(body)
+    async for event in agent.stream(body.message, context_notes=context_notes):
         yield f"data: {json.dumps(event)}\n\n"
 
 
 @app.post("/api/chat")
 async def chat(body: AgentMessage):
-    """Day 30: streaming counterpart to /api/agent/test — SSE, not one blob."""
+    """Day 30: streaming counterpart to /api/agent/test — SSE, not one blob.
+
+    Day 33: `body` may also carry `open_note_id`/`attached_note_ids` —
+    resolved to real note content up front, before the SSE response even
+    starts.
+    """
     if not body.message.strip():
         raise HTTPException(status_code=400, detail="'message' is required")
     return StreamingResponse(
-        _sse_events(body.message),
+        _sse_events(body),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
