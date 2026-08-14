@@ -81,3 +81,32 @@ body {
   padding: 0.4em 0.6em;
   text-align: left;
 }
+
+/* Chat messages reuse .markdown-body's prose defaults but at panel width,
+   so block spacing shouldn't be as generous as the full-page brief. */
+.chat-markdown {
+  line-height: 1.5;
+}
+/* The trailing markdown block (almost always a <p>) is forced inline so the
+   streaming cursor below lands right after the last character instead of
+   dropping to a line of its own. */
+.chat-markdown > :last-child {
+  display: inline;
+}
+
+/* Streaming cue: a blinking caret at the end of the in-progress assistant
+   message. Not shown once status flips to "done". */
+.chat-cursor {
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--color-accent);
+  animation: chat-blink 1s step-start infinite;
+}
+@keyframes chat-blink {
+  50% {
+    opacity: 0;
+  }
+}

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Outlet } from 'react-router-dom'
+import ChatPanel from './ChatPanel'
 import Sidebar from './Sidebar'
 
 // Shared with routed views via <Outlet context>. Only /graph currently
@@ -71,7 +72,7 @@ function Layout() {
   }, [searchQuery])
 
   return (
-    <div className="grid h-screen grid-cols-[220px_1fr_260px] bg-bg text-text font-sans">
+    <div className="grid h-screen grid-cols-[220px_1fr_320px] bg-bg text-text font-sans">
       <aside className="border-r border-border p-4 text-sm overflow-y-auto">
         <Sidebar
           activeTypes={activeTypes}
@@ -104,8 +105,8 @@ function Layout() {
         />
       </main>
 
-      <aside className="border-l border-border p-4 text-sm text-text-dim">
-        Agent HUD — coming Week 5.
+      <aside className="overflow-hidden border-l border-border">
+        <ChatPanel />
       </aside>
     </div>
   )
