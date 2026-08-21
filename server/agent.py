@@ -7,7 +7,12 @@ for the SSE endpoint in main.py. Day 33 adds per-message note context (the
 open note + @-mentions) — see `ContextNote` and `_augment_message` below.
 Day 34 adds the first real tool: `propose_note_write`, an in-process SDK
 MCP tool that can only ever *propose* a vault write, never perform one —
-see the "write proposals" section below.
+see the "write proposals" section below. Day 43 adds a second, standalone
+MCP server (`mcp_tools/vault_tools.py`'s get_active_projects) alongside
+this one — two independently-defined servers coexisting in `mcp_servers`.
+Day 44 adds the first *external* one (`mcp_tools/marketing_os.py`):
+get_campaign_stats and get_spend_summary, read-only, against the real
+marketing OS running at localhost:3000 — three servers now coexisting.
 """
 import asyncio
 import threading
@@ -29,6 +34,12 @@ from claude_agent_sdk import (
     tool,
 )
 
+from mcp_tools.marketing_os import (
+    GET_CAMPAIGN_STATS_TOOL,
+    GET_SPEND_SUMMARY_TOOL,
+    MARKETING_OS_TOOLS,
+)
+from mcp_tools.vault_tools import GET_ACTIVE_PROJECTS_TOOL, VAULT_TOOLS
 from vault import VAULT_DIR
 
 # The three files the system prompt is assembled from, in the order they're
@@ -49,6 +60,19 @@ MODEL = "claude-sonnet-5"
 # process; rebuilt in place, never left half-written.
 _cache_lock = threading.Lock()
 _system_prompt: str | None = None
+
+# Discovered live on Day 43, testing this file's own get_active_projects
+# tool: the SDK passes a string system_prompt as a literal `--system-prompt`
+# CLI argument to the spawned subprocess. Windows' CreateProcess has a
+# command-line length ceiling (~32,767 chars); MEMORY.md's organic growth
+# had already pushed the assembled prompt to 32,790 chars, so *every* real
+# chat request was silently crashing with CLINotFoundError/WinError 206
+# before this fix — not a Day 43 regression, a pre-existing bug Day 43's
+# testing happened to trip. Fixed by writing the prompt to a file and using
+# SystemPromptFile ({"type": "file", "path": ...}) instead of the raw
+# string — sidesteps the OS argument-length limit entirely; the file only
+# needs rewriting when the cache itself is rebuilt.
+_SYSTEM_PROMPT_FILE = Path(__file__).resolve().parent / "system_prompt_cache.md"
 
 
 def _read_context_file(path: Path) -> str:
@@ -74,7 +98,21 @@ def get_system_prompt() -> str:
     with _cache_lock:
         if _system_prompt is None:
             _system_prompt = assemble_system_prompt()
+            # Keep the on-disk copy in lockstep with the in-memory one —
+            # same rebuild trigger, same lock, so the two can never disagree.
+            _SYSTEM_PROMPT_FILE.write_text(_system_prompt, encoding="utf-8")
         return _system_prompt
+
+
+def get_system_prompt_file() -> str:
+    """Path to a file holding the current system prompt.
+
+    Callers pass this to ClaudeAgentOptions as
+    `{"type": "file", "path": get_system_prompt_file()}` instead of the raw
+    string — see the _SYSTEM_PROMPT_FILE comment above for why.
+    """
+    get_system_prompt()  # ensures the file exists and is current
+    return str(_SYSTEM_PROMPT_FILE)
 
 
 def invalidate_system_prompt() -> None:
@@ -165,6 +203,17 @@ _PROPOSE_WRITE_TOOL = "propose_note_write"
 # exactly this way) rather than assumed, since guessing wrong here would
 # mean every proposal silently fails permission instead of erroring loudly.
 _PROPOSE_WRITE_TOOL_NAME = f"mcp__jarvis__{_PROPOSE_WRITE_TOOL}"
+
+# Day 43: same naming convention, different server ("vault", defined and
+# owned entirely by mcp_tools/vault_tools.py — nothing about it lives here).
+_GET_ACTIVE_PROJECTS_TOOL_NAME = f"mcp__vault__{GET_ACTIVE_PROJECTS_TOOL}"
+
+# Day 44: same convention again, server "marketing_os" — the first pointed
+# at a system outside this process. Both tools are read-only; see
+# mcp_tools/marketing_os.py for why /api/agents/{id}/run and
+# /api/orchestrator are never referenced anywhere in that file.
+_GET_CAMPAIGN_STATS_TOOL_NAME = f"mcp__marketing_os__{GET_CAMPAIGN_STATS_TOOL}"
+_GET_SPEND_SUMMARY_TOOL_NAME = f"mcp__marketing_os__{GET_SPEND_SUMMARY_TOOL}"
 
 # Mirrors vault/CLAUDE.md's own frontmatter schema — reusing the vault's
 # documented conventions (type/tags/status/created/updated) rather than
@@ -326,7 +375,7 @@ async def ask(message: str, context_notes: list[ContextNote] | None = None) -> s
     """
     prompt = _augment_message(message, context_notes)
     options = ClaudeAgentOptions(
-        system_prompt=get_system_prompt(),
+        system_prompt={"type": "file", "path": get_system_prompt_file()},
         tools=[],  # no tools yet — Day 29 is loop-only
         model=MODEL,
         # `tools=[]` only zeroes the CLI's *built-in* tool set (--tools '').
@@ -386,18 +435,25 @@ async def stream(
     """
     prompt = _augment_message(message, context_notes)
     options = ClaudeAgentOptions(
-        system_prompt=get_system_prompt(),
+        system_prompt={"type": "file", "path": get_system_prompt_file()},
         tools=[],  # no *built-in* tools — --tools ''; unrelated to the MCP tool below
         model=MODEL,
         include_partial_messages=True,  # turns on StreamEvent token deltas
-        # Day 34: the one real tool this agent has, in-process and explicit.
-        # strict_mcp_config + setting_sources=[] (see ask()'s comment for the
-        # isolation reasoning) mean *only* this server is ever available —
-        # never an ambient one — and allowed_tools pre-authorizes just this
-        # tool so a headless server never sits waiting on an interactive
+        # Days 34, 43, 44: three independently-defined MCP servers,
+        # in-process and explicit — the third (marketing_os) is the first
+        # to actually reach outside this process. strict_mcp_config +
+        # setting_sources=[] (see ask()'s comment for the isolation
+        # reasoning) mean *only* these three are ever available — never an
+        # ambient one — and allowed_tools pre-authorizes exactly these
+        # tools so a headless server never sits waiting on an interactive
         # permission prompt nobody can answer.
-        mcp_servers={"jarvis": _JARVIS_TOOLS},
-        allowed_tools=[_PROPOSE_WRITE_TOOL_NAME],
+        mcp_servers={"jarvis": _JARVIS_TOOLS, "vault": VAULT_TOOLS, "marketing_os": MARKETING_OS_TOOLS},
+        allowed_tools=[
+            _PROPOSE_WRITE_TOOL_NAME,
+            _GET_ACTIVE_PROJECTS_TOOL_NAME,
+            _GET_CAMPAIGN_STATS_TOOL_NAME,
+            _GET_SPEND_SUMMARY_TOOL_NAME,
+        ],
         strict_mcp_config=True,
         setting_sources=[],
     )

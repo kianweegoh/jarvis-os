@@ -26,6 +26,9 @@ dist/
 *.sqlite3
 embeddings/
 
+# derived caches — rebuilt from vault/ on demand, never the source of truth
+server/system_prompt_cache.md
+
 # os
 .DS_Store
 Thumbs.db
