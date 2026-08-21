@@ -6,6 +6,7 @@ import datetime
 import os
 import sys
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -26,9 +27,18 @@ def get_credentials():
     if os.path.exists(TOKEN_PATH):
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
     if not creds or not creds.valid:
+        refreshed = False
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+                refreshed = True
+            except RefreshError:
+                # Refresh token itself was rejected (commonly: OAuth consent
+                # screen in "Testing" mode, where refresh tokens hard-expire
+                # 7 days after issuance regardless of use) — fall through to
+                # a fresh interactive consent instead of crashing.
+                print("Refresh token invalid/expired — re-authenticating...", file=sys.stderr)
+        if not refreshed:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
             creds = flow.run_local_server(port=0)
         with open(TOKEN_PATH, "w") as f:
