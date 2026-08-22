@@ -125,6 +125,27 @@ def _within_days(rows: list[dict[str, Any]], days: int) -> list[dict[str, Any]]:
     ]
 
 
+def _freshness_note(rows: list[dict[str, Any]]) -> str:
+    """A one-line freshness signal, always appended to a successful
+    response so staleness/sparsity is visible rather than inferred — Day
+    45: a tool returning correct-but-old data with no cue reads to the
+    model (and then the user) as current.
+
+    `rows` should be the *unfiltered* recent-metrics list, newest first
+    (see `_recent_metrics`), so this reflects what's actually available
+    rather than just what a `days` window happened to keep.
+    """
+    if not rows:
+        return "No campaign metrics recorded yet."
+    newest = rows[0]
+    week_end = datetime.fromisoformat(newest["weekEnd"].replace("Z", "+00:00"))
+    days_ago = (datetime.now(timezone.utc) - week_end).days
+    return (
+        f"Most recent data available: week of {newest['weekStart'][:10]} "
+        f"(ended {newest['weekEnd'][:10]}, {days_ago} day(s) ago)."
+    )
+
+
 GET_CAMPAIGN_STATS_TOOL = "get_campaign_stats"
 GET_SPEND_SUMMARY_TOOL = "get_spend_summary"
 
@@ -134,8 +155,13 @@ GET_SPEND_SUMMARY_TOOL = "get_spend_summary"
     "Weekly campaign performance rows from the marketing OS (Kalo Ads OS) "
     "covering roughly the last N days — spend, installs, CPI, CTR, trial "
     "conversion, and retention, per platform per week. The underlying data "
-    "is recorded weekly, not daily, so 'days' selects which recent weeks "
-    "to include rather than a true daily breakdown.",
+    "is recorded weekly, not daily: 'days' selects which recent weeks to "
+    "include, it does not produce a daily breakdown. If asked about a "
+    "specific day (e.g. 'yesterday' or 'how did we do today'), say plainly "
+    "that only weekly aggregates exist here — never present a week's "
+    "figure as if it were that single day's number. Every response also "
+    "states the most recent data available, so check that line before "
+    "treating the numbers as current.",
     {
         "type": "object",
         "properties": {
@@ -156,12 +182,22 @@ async def _get_campaign_stats(args: dict[str, Any]) -> dict[str, Any]:
         }
 
     try:
-        rows = _within_days(_recent_metrics(), days)
+        all_rows = _recent_metrics()
     except (MarketingOSError, requests.RequestException) as exc:
-        return {"content": [{"type": "text", "text": f"Couldn't reach the marketing OS: {exc}"}], "is_error": True}
+        return {
+            "content": [{"type": "text", "text": f"Marketing OS unreachable: {exc}"}],
+            "is_error": True,
+        }
+
+    rows = _within_days(all_rows, days)
+    freshness = _freshness_note(all_rows)
 
     if not rows:
-        text = f"No campaign metric rows in the last {days} days."
+        text = (
+            f"No campaign metric rows in the last {days} days."
+            if not all_rows
+            else f"No campaign metric rows in the last {days} days. {freshness}"
+        )
     else:
         lines = [f"Campaign metrics, last {days} days ({len(rows)} weekly row(s)):"]
         for row in rows:
@@ -172,6 +208,8 @@ async def _get_campaign_stats(args: dict[str, Any]) -> dict[str, Any]:
                 f"trial-conv {row['trialConversionRate']}% | "
                 f"D7 ret {row['day7Retention']}% | D30 ret {row['day30Retention']}%"
             )
+        lines.append("")
+        lines.append(freshness)
         text = "\n".join(lines)
 
     return {"content": [{"type": "text", "text": text}]}
@@ -182,14 +220,22 @@ async def _get_campaign_stats(args: dict[str, Any]) -> dict[str, Any]:
     "Aggregated spend/performance summary across the marketing OS's "
     "recent campaign history (the same source as get_campaign_stats, "
     "summarized rather than listed row by row) — total spend, total "
-    "installs, blended CPI, average CTR, broken down per platform.",
+    "installs, blended CPI, average CTR, broken down per platform. The "
+    "underlying data is recorded weekly, not daily — if asked about a "
+    "specific day, say plainly that only weekly aggregates exist rather "
+    "than presenting this summary as a daily figure. The response also "
+    "states the most recent data available, so check that line before "
+    "treating the numbers as current.",
     {"type": "object", "properties": {}},
 )
 async def _get_spend_summary(args: dict[str, Any]) -> dict[str, Any]:
     try:
         rows = _recent_metrics()
     except (MarketingOSError, requests.RequestException) as exc:
-        return {"content": [{"type": "text", "text": f"Couldn't reach the marketing OS: {exc}"}], "is_error": True}
+        return {
+            "content": [{"type": "text", "text": f"Marketing OS unreachable: {exc}"}],
+            "is_error": True,
+        }
 
     if not rows:
         return {"content": [{"type": "text", "text": "No campaign metrics recorded yet."}]}
@@ -221,6 +267,8 @@ async def _get_spend_summary(args: dict[str, Any]) -> dict[str, Any]:
             f"- {platform}: {len(prows)} week(s), spend ${p_spend:.2f}, "
             f"installs {p_installs}, blended CPI ${p_cpi:.2f}"
         )
+    lines.append("")
+    lines.append(_freshness_note(rows))
 
     return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
